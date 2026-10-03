@@ -178,7 +178,10 @@ BOOSTERS = {
     WAITING_BP_DESC,
     WAITING_BP_END_DATE,
     WAITING_BP_PHOTO,
-) = range(58)
+    WAITING_EDIT_TEAM_NAME,
+    WAITING_EDIT_TEAM_EMOJI,
+    WAITING_EDIT_TEAM_PHOTO,
+) = range(61)
 
 def get_db():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
@@ -238,6 +241,13 @@ def init_db():
         ADD COLUMN IF NOT EXISTS experience_bonus_until TIMESTAMP,
         ADD COLUMN IF NOT EXISTS money_bonus_percent INTEGER DEFAULT 0,
         ADD COLUMN IF NOT EXISTS money_bonus_until TIMESTAMP
+    ''')
+    
+    # ===== НОВЫЕ КОЛОНКИ ДЛЯ РАБОТ (ПАТЧ) =====
+    c.execute('''
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS photographer_cooldown_until TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS merch_cooldown_until TIMESTAMP
     ''')
     
     c.execute('''
@@ -811,10 +821,11 @@ def admin_menu_keyboard():
 def card_admin_keyboard():
     return ReplyKeyboardMarkup([
         ["📁 Создать коллекцию", "🛡 Создать команду"],
-        ["❌ Удалить команду", "🃏 Добавить карточку"],
-        ["❌ Удалить карточку", "📦 Добавить пак"],
-        ["📦 Настроить стартовый набор", "🎁 Выдать карточку игроку"],
-        ["💰 Выдать деньги", "🎟 Создать промокод"],
+        ["✏️ Редактировать команду", "❌ Удалить команду"],
+        ["🃏 Добавить карточку", "❌ Удалить карточку"],
+        ["📦 Добавить пак", "📦 Настроить стартовый набор"],
+        ["🎁 Выдать карточку игроку", "💰 Выдать деньги"],
+        ["🎟 Создать промокод"],
         ["⬅️ Выйти из настройки карточек"]
     ], resize_keyboard=True)
 
@@ -1172,6 +1183,8 @@ async def jobs_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🏒 Тренер бросков (КД 2ч)", callback_data="job_coach_main")],
         [InlineKeyboardButton("🕵️‍♂️ Нелегал (КД 12ч / 48ч)", callback_data="job_illegal_main")],
+        [InlineKeyboardButton("📸 Спортивный фотограф (КД 6ч)", callback_data="job_photographer")],
+        [InlineKeyboardButton("🎟 Продавец атрибутики (КД 2ч)", callback_data="job_merch_main")],
         [InlineKeyboardButton("🔙 Главное меню", callback_data="back_to_main_inline")]
     ])
 
@@ -1185,7 +1198,9 @@ async def jobs_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "2️⃣ **Нелегал:**\n"
         "• Различные рискованные дела (Банк, Кошелек, Магазин).\n"
         "• Возможность заработать до **100 000 RPLCoin**!\n"
-        "• Риск попасть в тюрьму (КД **48 часов**)!"
+        "• Риск попасть в тюрьму (КД **48 часов**)!\n\n"
+        "3️⃣ **Спортивный фотограф:** 60% — 5 000, 30% — 15 000, 10% — 40 000 RPL и редкая карточка. КД **6 часов**.\n\n"
+        "4️⃣ **Продавец атрибутики:** выберите цену товара; возможная выручка — **2 000–40 000 RPLCoin**. КД **2 часа**."
     )
 
     if update.callback_query:
@@ -1433,6 +1448,112 @@ async def job_illegal_action_handler(update: Update, context: ContextTypes.DEFAU
 
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад к работам", callback_data="jobs_menu")]])
     await query.edit_message_text(f"🕵️‍♂️ **Результат работы «Нелегал»:**\n\n{res_text}", reply_markup=kb, parse_mode="Markdown")
+
+# ==================== НОВЫЕ РАБОТЫ (ПАТЧ) ====================
+async def job_photographer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT photographer_cooldown_until FROM users WHERE user_id = %s", (user_id,))
+    row = c.fetchone() or {}
+    now = datetime.now()
+    until = row.get("photographer_cooldown_until")
+    if until and isinstance(until, str):
+        until = datetime.fromisoformat(until)
+    if until and now < until:
+        remaining = until - now
+        hours, rem = divmod(int(remaining.total_seconds()), 3600)
+        await query.edit_message_text(
+            f"⏳ Следующий снимок можно сделать через {hours} ч {rem // 60} мин.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад к работам", callback_data="jobs_menu")]])
+        )
+        conn.close()
+        return
+
+    roll = random.random()
+    reward = 5000 if roll < 0.60 else 15000 if roll < 0.90 else 40000
+    final_reward = add_job_money(c, user_id, reward)
+    result = f"📸 Удачный кадр! Начислено **{final_reward:,} RPLCoin**."
+    if roll >= 0.90:
+        c.execute("SELECT id FROM cards WHERE rarity = 'Редкая' ORDER BY RANDOM() LIMIT 1")
+        card = c.fetchone()
+        if card:
+            c.execute("INSERT INTO user_cards (user_id, card_id, count) VALUES (%s, %s, 1) ON CONFLICT (user_id, card_id) DO UPDATE SET count = user_cards.count + 1", (user_id, card['id']))
+            c.execute("SELECT nickname, ovr FROM cards WHERE id = %s", (card['id'],))
+            details = c.fetchone()
+            result += f"\n🌟 Редкий кадр! Бонусная карточка: **{details['nickname']}** ({details['ovr']} OVR)."
+        else:
+            result += "\n🌟 Кадр редкий, но карточек редкости «Редкая» пока нет в базе."
+    c.execute("UPDATE users SET photographer_cooldown_until = %s WHERE user_id = %s", (now + timedelta(hours=6), user_id))
+    conn.commit()
+    conn.close()
+    await query.edit_message_text(result + "\n\n⏳ КД: 6 часов.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад к работам", callback_data="jobs_menu")]]), parse_mode="Markdown")
+
+
+async def job_merch_main_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT merch_cooldown_until FROM users WHERE user_id = %s", (user_id,))
+    row = c.fetchone() or {}
+    conn.close()
+    until = row.get("merch_cooldown_until")
+    if until and isinstance(until, str):
+        until = datetime.fromisoformat(until)
+    if until and datetime.now() < until:
+        remaining = until - datetime.now()
+        hours, rem = divmod(int(remaining.total_seconds()), 3600)
+        await query.edit_message_text(f"⏳ До следующей смены: {hours} ч {rem // 60} мин.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад к работам", callback_data="jobs_menu")]]))
+        return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧣 Дешёвая цена — больше покупателей", callback_data="job_merch_cheap")],
+        [InlineKeyboardButton("🚩 Средняя цена", callback_data="job_merch_medium")],
+        [InlineKeyboardButton("🧥 Дорогая цена — меньше покупателей", callback_data="job_merch_expensive")],
+        [InlineKeyboardButton("🔙 Назад к работам", callback_data="jobs_menu")],
+    ])
+    await query.edit_message_text("🎟 **Продавец атрибутики**\nВыберите цену товаров на арене. Высокая цена приносит больше за продажу, но снижает шанс найти покупателей.", reply_markup=kb, parse_mode="Markdown")
+
+
+async def job_merch_action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    tier = query.data.rsplit("_", 1)[-1]
+    settings = {
+        "cheap": (0.85, 2000, 12000),
+        "medium": (0.60, 8000, 26000),
+        "expensive": (0.35, 18000, 40000),
+    }
+    if tier not in settings:
+        return
+    chance, low, high = settings[tier]
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT merch_cooldown_until FROM users WHERE user_id = %s FOR UPDATE", (user_id,))
+    row = c.fetchone() or {}
+    now = datetime.now()
+    until = row.get("merch_cooldown_until")
+    if until and isinstance(until, str):
+        until = datetime.fromisoformat(until)
+    if until and now < until:
+        conn.close()
+        await query.answer("Смена ещё недоступна — подождите окончания КД.", show_alert=True)
+        return
+    if random.random() < chance:
+        reward = add_job_money(c, user_id, random.randint(low, high))
+        result = f"🎉 Продажа удалась! Выручка: **{reward:,} RPLCoin**."
+    else:
+        result = "😔 Покупателей не нашлось — сегодня без выручки."
+    c.execute("UPDATE users SET merch_cooldown_until = %s WHERE user_id = %s", (now + timedelta(hours=2), user_id))
+    conn.commit()
+    conn.close()
+    await query.edit_message_text(result + "\n\n⏳ Следующая смена через 2 часа.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад к работам", callback_data="jobs_menu")]]), parse_mode="Markdown")
+
+# =========================================================
 
 async def rps_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
@@ -4067,6 +4188,18 @@ async def admin_card_menu_handler(update: Update, context: ContextTypes.DEFAULT_
     elif text == "🛡 Создать команду":
         await update.message.reply_text("🛡 Введите название команды:")
         return ADD_TEAM_NAME
+    elif text == "✏️ Редактировать команду":
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT id, name, emoji FROM card_teams ORDER BY name")
+        teams = c.fetchall()
+        conn.close()
+        if not teams:
+            await update.message.reply_text("📭 Команд пока нет.", reply_markup=card_admin_keyboard())
+            return CARD_ADMIN_MENU
+        buttons = [[InlineKeyboardButton(f"{t['emoji']} {t['name']}", callback_data=f"edit_team_{t['id']}")] for t in teams]
+        await update.message.reply_text("Выберите команду для редактирования:", reply_markup=InlineKeyboardMarkup(buttons))
+        return DEL_TEAM_SELECT
     elif text == "❌ Удалить команду":
         conn = get_db()
         c = conn.cursor()
@@ -4125,11 +4258,14 @@ async def save_team_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def save_team_emoji(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["team_emoji"] = update.message.text.strip()
-    await update.message.reply_text("🖼 Отправьте логотип (или `-`):")
+    await update.message.reply_text("🖼 Отправьте фотографию команды. Фото обязательно:")
     return ADD_TEAM_PHOTO
 
 async def save_team_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    photo_id = update.message.photo[-1].file_id if update.message.photo else None
+    if not update.message.photo:
+        await update.message.reply_text("❌ Нужно отправить именно фотографию команды.")
+        return ADD_TEAM_PHOTO
+    photo_id = update.message.photo[-1].file_id
     name = context.user_data.get("team_name")
     emoji = context.user_data.get("team_emoji", "🏒")
 
@@ -4147,6 +4283,21 @@ async def save_team_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def delete_team_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if query.data.startswith("edit_team_"):
+        team_id = int(query.data.split("_")[2])
+        context.user_data["edit_team_id"] = team_id
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT name, emoji, photo_id FROM card_teams WHERE id = %s", (team_id,))
+        team = c.fetchone()
+        conn.close()
+        if not team:
+            await query.edit_message_text("Команда не найдена.")
+            return CARD_ADMIN_MENU
+        context.user_data["edit_team_name"] = team["name"]
+        context.user_data["edit_team_emoji"] = team["emoji"]
+        await query.message.reply_text(f"Текущее название: {team['name']}\nОтправьте новое название или '-' чтобы оставить без изменений:")
+        return WAITING_EDIT_TEAM_NAME
     team_id = int(query.data.split("_")[2])
     conn = get_db()
     c = conn.cursor()
@@ -4154,6 +4305,54 @@ async def delete_team_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     conn.commit()
     conn.close()
     await query.edit_message_text("✅ Удалено!")
+    return CARD_ADMIN_MENU
+
+async def edit_team_name_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text != "-":
+        context.user_data["edit_team_name"] = text
+    await update.message.reply_text("Введите новый эмодзи или '-' чтобы оставить без изменений:")
+    return WAITING_EDIT_TEAM_EMOJI
+
+async def edit_team_emoji_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text != "-":
+        context.user_data["edit_team_emoji"] = text
+    await update.message.reply_text("Отправьте новое фото команды или /skip чтобы оставить старое:")
+    return WAITING_EDIT_TEAM_PHOTO
+
+async def edit_team_photo_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        await update.message.reply_text("❌ Отправьте фотографию или используйте /skip.")
+        return WAITING_EDIT_TEAM_PHOTO
+    team_id = context.user_data.get("edit_team_id")
+    name = context.user_data.get("edit_team_name")
+    emoji = context.user_data.get("edit_team_emoji")
+    photo_id = update.message.photo[-1].file_id
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE card_teams SET name=%s, emoji=%s, photo_id=%s WHERE id=%s", (name, emoji, photo_id, team_id))
+    conn.commit()
+    conn.close()
+    context.user_data.pop("edit_team_id", None)
+    context.user_data.pop("edit_team_name", None)
+    context.user_data.pop("edit_team_emoji", None)
+    await update.message.reply_text("✅ Команда обновлена!", reply_markup=card_admin_keyboard())
+    return CARD_ADMIN_MENU
+
+async def edit_team_photo_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    team_id = context.user_data.get("edit_team_id")
+    name = context.user_data.get("edit_team_name")
+    emoji = context.user_data.get("edit_team_emoji")
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE card_teams SET name=%s, emoji=%s WHERE id=%s", (name, emoji, team_id))
+    conn.commit()
+    conn.close()
+    context.user_data.pop("edit_team_id", None)
+    context.user_data.pop("edit_team_name", None)
+    context.user_data.pop("edit_team_emoji", None)
+    await update.message.reply_text("✅ Команда обновлена!", reply_markup=card_admin_keyboard())
     return CARD_ADMIN_MENU
 
 async def card_set_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4210,18 +4409,13 @@ async def card_set_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def card_set_ovr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         context.user_data["c_ovr"] = int(update.message.text.strip())
-        await update.message.reply_text("🖼 Отправьте фото карточки:")
-        return ADD_CARD_PHOTO
+        return await card_save_all(update, context)
     except ValueError:
         await update.message.reply_text("❌ Введите число!")
         return ADD_CARD_OVR
 
 async def card_save_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo_id = None
-    if update.message.photo:
-        photo_id = update.message.photo[-1].file_id
-    elif update.message.animation:
-        photo_id = update.message.animation.file_id
 
     rarity = context.user_data.get("c_rarity")
     col_name = context.user_data.get("c_collection")
@@ -4428,7 +4622,6 @@ def _active_bp():
     conn.close()
     return row
 
-# Глобальная переменная для кэша наград (определите в начале файла, например, после импортов)
 _BP_REWARDS_CACHE = None
 
 def _bp_rewards():
@@ -4437,7 +4630,7 @@ def _bp_rewards():
         return _BP_REWARDS_CACHE
     
     import random
-    rng = random.Random(42)  # фиксированный seed для детерминизма
+    rng = random.Random(42)
 
     pool = [
         ("money", "💰 1 000 RPLCoin", 1000),
@@ -4492,7 +4685,6 @@ def _bp_rewards():
         expanded.extend(shuffled)
     expanded = expanded[:total_levels]
 
-    # Убираем повторяющиеся соседние награды
     for i in range(1, len(expanded)):
         if expanded[i][0] == expanded[i-1][0] and expanded[i][1] == expanded[i-1][1]:
             for j in range(i+1, min(i+10, len(expanded))):
@@ -4504,10 +4696,8 @@ def _bp_rewards():
     for level in range(1, total_levels+1):
         rewards[level] = expanded[level-1]
 
-    # Легендарные бустеры на фиксированных уровнях
     for level in [50, 70, 90, 110, 130, 150, 170, 190, 210, 230]:
         rewards[level] = ("booster", "🟡 Легендарный бустер", "legendary")
-    # Эксклюзивная карточка на 250 уровне
     rewards[250] = ("card_ovr", "👑 Эксклюзивная карточка 97–99 OVR", (97, 99))
 
     _BP_REWARDS_CACHE = rewards
@@ -4530,6 +4720,8 @@ def _bp_prepare_quests(season_id, user_id):
     row = _bp_get_player(season_id, user_id)
     now = datetime.now()
     reset = row['quest_reset_at']
+    if reset and isinstance(reset, str):
+        reset = datetime.fromisoformat(reset)
     if reset and now - reset < timedelta(hours=12) and row['quest_ids']:
         return row
     ids = random.sample(list(BATTLE_PASS_QUESTS), 6)
@@ -4567,7 +4759,7 @@ def bp_progress(user_id, event, amount=1):
     key = event
     progress[key] = min(BATTLE_PASS_QUESTS[key][2], progress.get(key, 0) + amount)
     gained = 0
-    if progress[key] >= BATTLE_PASS_QUESTS[key][2] and row['quest_progress'] and progress.get(f'_done_{key}') != 1:
+    if progress[key] >= BATTLE_PASS_QUESTS[key][2] and progress.get(f'_done_{key}') != 1:
         gained = BATTLE_PASS_QUESTS[key][3]
         progress[f'_done_{key}'] = 1
     conn = get_db()
@@ -4596,7 +4788,6 @@ def _manual_refresh_quests(season_id, user_id):
             minutes = (remaining.seconds % 3600) // 60
             conn.close()
             return False, f"⏳ Вы можете обновлять задания не чаще 1 раза в сутки. Осталось: {hours} ч {minutes} мин"
-    # Генерируем новые задания
     ids = random.sample(list(BATTLE_PASS_QUESTS), 6)
     progress = {key: 0 for key in ids}
     c.execute("""
@@ -4611,7 +4802,6 @@ def _manual_refresh_quests(season_id, user_id):
 def _bp_level(xp):
     return min(BATTLE_PASS_LEVELS, xp // BATTLE_PASS_XP_PER_LEVEL)
 
-# Вспомогательная функция для генерации сообщения боевого пропуска
 def _get_bp_main_message(season, user_id):
     row = _bp_prepare_quests(season['id'], user_id)
     import ast
@@ -4656,7 +4846,6 @@ async def battle_pass_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if not season:
         return await q.edit_message_text("🎫 Активного боевого пропуска нет.")
 
-    # Удаляем старое сообщение, чтобы не было конфликтов с фото
     try:
         await q.message.delete()
     except Exception:
@@ -4695,10 +4884,6 @@ async def battle_pass_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         await q.answer(msg, show_alert=True)
         text, kb = _get_bp_main_message(season, q.from_user.id)
-        try:
-            await q.message.delete()
-        except:
-            pass
         if season['photo_id']:
             try:
                 await context.bot.send_photo(chat_id=q.from_user.id, photo=season['photo_id'], caption=text, reply_markup=kb, parse_mode='Markdown')
@@ -5506,8 +5691,14 @@ def main():
             ADD_COLLECTION_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_collection)],
             ADD_TEAM_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_team_name)],
             ADD_TEAM_EMOJI: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_team_emoji)],
-            ADD_TEAM_PHOTO: [MessageHandler(filters.PHOTO | filters.TEXT, save_team_photo)],
-            DEL_TEAM_SELECT: [CallbackQueryHandler(delete_team_callback, pattern="^del_team_")],
+            ADD_TEAM_PHOTO: [MessageHandler(filters.PHOTO, save_team_photo)],
+            DEL_TEAM_SELECT: [CallbackQueryHandler(delete_team_callback, pattern="^(del_team_|edit_team_)")],
+            WAITING_EDIT_TEAM_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_team_name_receive)],
+            WAITING_EDIT_TEAM_EMOJI: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_team_emoji_receive)],
+            WAITING_EDIT_TEAM_PHOTO: [
+                MessageHandler(filters.PHOTO, edit_team_photo_receive),
+                CommandHandler("skip", edit_team_photo_skip),
+            ],
             ADD_CARD_RARITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, card_set_rarity)],
             ADD_CARD_COLLECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, card_set_collection)],
             ADD_CARD_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, card_set_country)],
@@ -5575,6 +5766,10 @@ def main():
     app.add_handler(CallbackQueryHandler(job_coach_action_handler, pattern="^job_coach_shoot"))
     app.add_handler(CallbackQueryHandler(job_illegal_main_handler, pattern="^job_illegal_main$"))
     app.add_handler(CallbackQueryHandler(job_illegal_action_handler, pattern="^job_ill_"))
+    # ===== НОВЫЕ РАБОТЫ (ПАТЧ) =====
+    app.add_handler(CallbackQueryHandler(job_photographer_handler, pattern="^job_photographer$"))
+    app.add_handler(CallbackQueryHandler(job_merch_main_handler, pattern="^job_merch_main$"))
+    app.add_handler(CallbackQueryHandler(job_merch_action_handler, pattern="^job_merch_(cheap|medium|expensive)$"))
 
     app.add_handler(CallbackQueryHandler(inventory_callback_handler, pattern="^(refresh_inv|craft_leg_|sell_menu|do_sell_)"))
     app.add_handler(CallbackQueryHandler(market_callback_handler, pattern="^(refresh_market|my_market_items|market_list_menu|cancel_market_|buy_market_)"))
